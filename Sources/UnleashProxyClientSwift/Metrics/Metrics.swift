@@ -9,11 +9,13 @@ public class Metrics {
     let poster: PosterHandler
     let clock: () -> Date
     var disableMetrics: Bool
-    var timer: Timer?
+    var timer: DispatchSourceTimer?
     var bucket: Bucket
     let url: URL
     let customHeaders: [String: String]
     let connectionId: UUID
+
+    private let queue: DispatchQueue
 
     init(appName: String,
          metricsInterval: TimeInterval,
@@ -23,7 +25,8 @@ public class Metrics {
          url: URL,
          clientKey: String,
          customHeaders: [String: String] = [:],
-         connectionId: UUID) {
+         connectionId: UUID,
+         queue: DispatchQueue = DispatchQueue(label: "io.getunleash.metrics")) {
         self.appName = appName
         self.metricsInterval = metricsInterval
         self.clock = clock
@@ -34,21 +37,36 @@ public class Metrics {
         self.bucket = Bucket(clock: clock)
         self.customHeaders = customHeaders
         self.connectionId = connectionId
+        self.queue = queue
     }
 
     func start() {
         if disableMetrics { return }
 
-        self.timer = Timer.scheduledTimer(withTimeInterval: metricsInterval, repeats: true) { _ in
+        queue.sync {
+            self.timer?.cancel()
+            self.timer = nil
+        }
+
+        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .background))
+        timer.schedule(deadline: .now() + self.metricsInterval, repeating: self.metricsInterval)
+        timer.setEventHandler { [weak self] in
+            guard let self = self else { return }
             self.sendMetrics()
+        }
+        timer.resume()
+
+        queue.sync {
+            self.timer = timer
         }
     }
 
     func stop() {
-        self.timer?.invalidate()
+        queue.sync {
+            self.timer?.cancel()
+            self.timer = nil
+        }
     }
-    
-    private let queue = DispatchQueue(label: "io.getunleash.metrics")
 
     func count(name: String, enabled: Bool) {
         if disableMetrics { return }
@@ -75,11 +93,14 @@ public class Metrics {
     }
 
     func sendMetrics() {
-        bucket.closeBucket()
-        guard !bucket.isEmpty() else { return }
+        let localBucket: Bucket = queue.sync {
+            bucket.closeBucket()
+            let result = bucket
+            bucket = Bucket(clock: clock)
+            return result
+        }
 
-        let localBucket = bucket
-        bucket = Bucket(clock: clock)
+        guard !localBucket.isEmpty() else { return }
 
         do {
             let payload = MetricsPayload(appName: appName, instanceId: "swift", bucket: localBucket)
